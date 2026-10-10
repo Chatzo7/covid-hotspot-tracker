@@ -1,432 +1,331 @@
+const path = require('path')
 const express = require('express')
+const session = require('express-session')
+const bcrypt = require('bcryptjs')
+const fileUpload = require('express-fileupload')
+const mysql = require('mysql2')
+
 const app = express()
-const port = 3000
-const bodyParser = require('body-parser');
-const fileUpload = require('express-fileupload');
+const port = process.env.PORT || 3000
 
+app.use(express.json())
+app.use(express.urlencoded({ extended: false }))
+app.use(fileUpload())
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'change-this-secret',
+    resave: false,
+    saveUninitialized: false,
+}))
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: false }));
+// Database connection settings come from environment variables (with local defaults).
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'ceid_project',
+})
+const myDatabase = pool.promise()
 
-app.use(fileUpload());
+// EJS templates live in the project root.
+app.set('view engine', 'ejs')
+app.set('views', __dirname)
 
-const mysql = require('mysql2');
-const pool = mysql.createPool({ host: 'localhost', user: 'root', database: 'ceid_project' });
-const myDatabase = pool.promise();
+const SALT_ROUNDS = 10
 
+// ---------- helpers ----------
 
-let loggedInUser = {
-    loggedInUserId: 1,
-    loggedInUserUsername: '',
-    loggedInUserEmail: '',
+function requireLogin(req, res, next) {
+    if (!req.session.user) return res.status(401).send('Please sign in first')
+    next()
 }
 
+function requireAdmin(req, res, next) {
+    if (!req.session.user || !req.session.user.isAdmin) return res.status(403).send('Admins only')
+    next()
+}
 
-// ka8orizei oti anti gia html 8a xrisimopoioume ejs.
-app.set('view enigne', 'ejs')
-app.set('views', './views')
+function countTypes(rows) {
+    const counts = {}
+    rows.forEach(point => {
+        JSON.parse(point.types).forEach(type => {
+            counts[type] = (counts[type] || 0) + 1
+        })
+    })
+    return counts
+}
 
-app.listen(port, () => {
-    console.log(`Example app listening at http://localhost:${port}`)
-})
+// ---------- pages ----------
 
+app.get('/', (req, res) => res.render('index.ejs'))
+app.get('/register', (req, res) => res.render('register.ejs'))
+app.get('/editprofile', requireLogin, (req, res) => res.render('editprofile.ejs'))
+app.get('/userpage', requireLogin, (req, res) => res.render('userPage.ejs'))
+app.get('/adminpage', requireAdmin, (req, res) => res.render('adminPage.ejs'))
 
-app.get('/editprofile', (req, res) => {
-    res.render('editprofile.ejs')
+// ---------- authentication ----------
 
-})
+app.post('/signin', async (req, res) => {
+    const { email, password } = req.body
+    const [rows] = await myDatabase.query('SELECT * FROM users WHERE email = ?', [email])
+    const user = rows[0]
 
-app.get('/', (req, res) => {
-    res.render('index.ejs')
-})
-
-app.get('/register', (req, res) => {
-    res.render('register.ejs')
-})
-
-app.get('/userpage', (req, res) => {
-    res.render('userpage.ejs')
-})
-
-app.get('/adminpage', (req, res) => {
-    res.render('adminpage.ejs')
-})
-
-
-app.post('/signin', async function (req, res) {
-    console.log(req.body)
-    const email = req.body.email
-    const password = req.body.password
-
-    const resp = await myDatabase.query(`SELECT * FROM users WHERE email='${email}' AND password='${password}'`)
-    if (resp[0].length > 0) {
-        loggedInUser.loggedInUserUsername = resp[0][0].username
-        loggedInUser.loggedInUserId = resp[0][0].userID
-        loggedInUser.loggedInUserEmail = resp[0][0].email
-        if (resp[0][0].isAdmin) {
-            res.redirect('/adminpage')
-        } else {
-            res.redirect('/userpage')
-
-        }
-    } else {
-
-        res.status(401).send('wrong data')
+    if (!user || !(await bcrypt.compare(password || '', user.password))) {
+        return res.status(401).send('wrong data')
     }
+
+    req.session.user = {
+        id: user.userID,
+        username: user.username,
+        email: user.email,
+        isAdmin: !!user.isAdmin,
+    }
+    res.redirect(user.isAdmin ? '/adminpage' : '/userpage')
 })
 
-app.post('/register', async function (req, res) {
-    console.log(req.body);
-    const email = req.body.email
-    const password = req.body.password;
-    const username = req.body.username;
-
+app.post('/register', async (req, res) => {
+    const { email, password, username } = req.body
+    if (!email || !password || !username) return res.status(400).send('Συμπληρώστε όλα τα πεδία')
 
     try {
-        const resp = await myDatabase.query(`INSERT INTO users(username, password, email, isAdmin) VALUES('${username}','${password}','${email}', 0)`)
+        const hash = await bcrypt.hash(password, SALT_ROUNDS)
+        await myDatabase.query(
+            'INSERT INTO users (username, password, email, isAdmin) VALUES (?, ?, ?, 0)',
+            [username, hash, email]
+        )
         res.status(200).send('Εγγραφήκατε Επιτυχως')
     } catch (error) {
-        console.log(error);
+        console.log(error)
         res.status(403).send('Εχετε ήδη εγγεγραφει')
-
     }
-
 })
 
-app.post('/upload_data', async function (req, res) {
-    const file = req.files.file1;
-    console.log(file);
-    const parseJson = JSON.parse(file.data);
-    console.log(parseJson);
+app.post('/editprofile', requireLogin, async (req, res) => {
+    const updates = []
+    const values = []
 
-    const extract_desiredData = parseJson.map(poi => {
-        return {
-            givenId: poi.id,
-            name: poi.name,
-            address: poi.address,
-            types: poi.types,
-            coordinates: poi.coordinates,
-            populartimes: poi.populartimes
-        }
-    });
-    console.log(extract_desiredData);
-    // return;
-    extract_desiredData.map(async entry => {
-        const sql = `INSERT INTO points_of_interest(givenId,name,address,coordinates,types) VALUES(\'${entry.givenId}\',\'${entry.name}\',\'${entry.address}\',Point(${entry.coordinates.lat},${entry.coordinates.lng}),'${JSON.stringify(entry.types)}' )`
+    if (req.body.email) { updates.push('email = ?'); values.push(req.body.email) }
+    if (req.body.username) { updates.push('username = ?'); values.push(req.body.username) }
+    if (req.body.password) { updates.push('password = ?'); values.push(await bcrypt.hash(req.body.password, SALT_ROUNDS)) }
+
+    if (updates.length === 0) return res.status(400).send('Nothing to update')
+
+    values.push(req.session.user.id)
+    const [result] = await myDatabase.query(`UPDATE users SET ${updates.join(', ')} WHERE userID = ?`, values)
+
+    if (result.affectedRows > 0) {
+        if (req.body.email) req.session.user.email = req.body.email
+        if (req.body.username) req.session.user.username = req.body.username
+        res.status(200).send('Profile Updated Successfully')
+    } else {
+        res.status(500).send('something went wrong')
+    }
+})
+
+// ---------- admin ----------
+
+app.post('/upload_data', requireAdmin, async (req, res) => {
+    if (!req.files || !req.files.file1) return res.status(400).send('No file uploaded')
+
+    let pois
+    try {
+        pois = JSON.parse(req.files.file1.data)
+    } catch (error) {
+        return res.status(400).send('Invalid JSON file')
+    }
+
+    for (const poi of pois) {
         try {
-            const resp = await myDatabase.query(sql);
+            const [result] = await myDatabase.query(
+                'INSERT INTO points_of_interest (givenId, name, address, coordinates, types) VALUES (?, ?, ?, Point(?, ?), ?)',
+                [poi.id, poi.name, poi.address, poi.coordinates.lat, poi.coordinates.lng, JSON.stringify(poi.types)]
+            )
+            const pointId = result.insertId
 
-            resp[0].insertId;
-            entry.populartimes.map(async (a) => {
-                const sqlPopular = `INSERT INTO poi_popular_times(pointId, \`day\`,
-                hour_0,
-                hour_1,
-                hour_2,
-                hour_3,
-                hour_4,
-                hour_5,
-                hour_6,
-                hour_7,
-                hour_8,
-                hour_9,
-                hour_10,
-                hour_11,
-                hour_12,
-                hour_13,
-                hour_14,
-                hour_15,
-                hour_16,
-                hour_17,
-                hour_18,
-                hour_19,
-                hour_20,
-                hour_21,
-                hour_22,
-                hour_23)
-                VALUES(${resp[0].insertId},
-                     '${a.name}',
-                    '${a.data[0]}',
-                    '${a.data[2]}',
-                    '${a.data[3]}',
-                    '${a.data[4]}',
-                    '${a.data[5]}',
-                    '${a.data[6]}',
-                    '${a.data[7]}',
-                    '${a.data[8]}',
-                    '${a.data[9]}',
-                    '${a.data[10]}',
-                    '${a.data[11]}',
-                    '${a.data[12]}',
-                    '${a.data[13]}',
-                    '${a.data[14]}',
-                    '${a.data[15]}',
-                    '${a.data[16]}',
-                    '${a.data[17]}',
-                    '${a.data[18]}',
-                    '${a.data[19]}',
-                    '${a.data[20]}',
-                    '${a.data[21]}',
-                    '${a.data[22]}',
-                    '${a.data[23]}',
-                    '${a.data[23]}'                    
-                    )`
-                const respaaa = await myDatabase.query(sqlPopular);
-
-            })
-
+            for (const day of poi.populartimes || []) {
+                const hours = Array.from({ length: 24 }, (_, h) => day.data[h] ?? null)
+                const hourColumns = hours.map((_, h) => `hour_${h}`).join(', ')
+                const placeholders = hours.map(() => '?').join(', ')
+                await myDatabase.query(
+                    `INSERT INTO poi_popular_times (pointId, \`day\`, ${hourColumns}) VALUES (?, ?, ${placeholders})`,
+                    [pointId, day.name, ...hours]
+                )
+            }
         } catch (error) {
-            console.log(error);
+            // Duplicate POIs (same givenId) are skipped.
+            console.log(error.message)
         }
-    })
-
+    }
 
     res.send('Τα δεδομένα έχουν μπεί μοναδικά στην βάση')
 })
 
-
-app.delete("/delete_all", async function (req, res) {
-
+app.delete('/delete_all', requireAdmin, async (req, res) => {
     try {
-        await myDatabase.query(`DELETE from infected_users`)
-        await myDatabase.query(`DELETE from poi_popular_times`)
-        await myDatabase.query(`DELETE from points_of_interest`)
-        await myDatabase.query(`DELETE from uservisitedpoint `)
+        await myDatabase.query('DELETE FROM infected_users')
+        await myDatabase.query('DELETE FROM poi_popular_times')
+        await myDatabase.query('DELETE FROM uservisitedpoint')
+        await myDatabase.query('DELETE FROM points_of_interest')
         res.send('ok')
-
     } catch (error) {
-
-        res.status(401).send('not_ok')
+        console.log(error)
+        res.status(500).send('not_ok')
     }
 })
 
-app.get('/bring_data', async function (req, res) {
+app.get('/admin_data', requireAdmin, async (req, res) => {
+    const [[visits]] = await myDatabase.query('SELECT COUNT(*) AS totalVisits FROM uservisitedpoint')
+    const [[infections]] = await myDatabase.query('SELECT COUNT(*) AS totalInfections FROM infected_users')
 
-    const todayName = new Date().toLocaleString("default", { weekday: "long" })
-    const params = req.query.param;
-    console.log(params, '123q');
-    const sql = `SELECT * FROM points_of_interest
-     INNER JOIN poi_popular_times on points_of_interest.pointId=poi_popular_times.pointId
-     WHERE types LIKE '%${params}%' AND day='${todayName}'`;
-    console.log(sql);
-    const data = await myDatabase.query(sql)
-    console.log(data[0]);
+    const [popularPois] = await myDatabase.query(`
+        SELECT points_of_interest.pointId, COUNT(points_of_interest.pointId) AS totalVisits, types
+        FROM users
+        INNER JOIN uservisitedpoint ON users.userID = uservisitedpoint.userID
+        INNER JOIN points_of_interest ON uservisitedpoint.pointId = points_of_interest.pointId
+        GROUP BY pointId
+        ORDER BY totalVisits DESC`)
 
-    const allPois = data[0].map(point => {
-        const { pointId,
+    const [popularCovidPois] = await myDatabase.query(`
+        SELECT points_of_interest.pointId, COUNT(points_of_interest.pointId) AS totalVisits, types, isInfected
+        FROM users
+        INNER JOIN uservisitedpoint ON users.userID = uservisitedpoint.userID
+        INNER JOIN points_of_interest ON uservisitedpoint.pointId = points_of_interest.pointId
+        INNER JOIN infected_users ON infected_users.userID = users.userID
+        WHERE isInfected = 1
+          AND DATE(timestamp) > DATE_SUB(infected_date, INTERVAL 7 DAY)
+          AND DATE(timestamp) < DATE_ADD(infected_date, INTERVAL 14 DAY)
+        GROUP BY pointId
+        ORDER BY totalVisits DESC`)
+
+    res.send({
+        totalVisits: visits.totalVisits,
+        totalInfections: infections.totalInfections,
+        popularity: countTypes(popularPois),
+        popularityInfected: countTypes(popularCovidPois),
+    })
+})
+
+// ---------- user ----------
+
+app.get('/bring_data', requireLogin, async (req, res) => {
+    const todayName = new Date().toLocaleString('en-US', { weekday: 'long' })
+    const searchTerm = req.query.param || ''
+
+    const [rows] = await myDatabase.query(
+        `SELECT * FROM points_of_interest
+         INNER JOIN poi_popular_times ON points_of_interest.pointId = poi_popular_times.pointId
+         WHERE types LIKE ? AND day = ?`,
+        [`%${searchTerm}%`, todayName]
+    )
+
+    const allPois = rows.map(point => {
+        const { pointId, givenId, name, types, address, coordinates, pt_id, day, ...hours } = point
+        return {
+            pointId,
             givenId,
             name,
-            types,
+            types: JSON.parse(types),
             address,
             coordinates,
-            pt_id, day, ...rest } = point
-
-
-        const popularity = {
-            day: day,
-            value: Object.values(rest)
+            pt_id,
+            popularity: { day, value: Object.values(hours) },
         }
-
-
-        // console.log(popularity)
-        const point_of_interest = {
-            pointId: pointId,
-            givenId: givenId,
-            name: name,
-            types: JSON.parse(types),
-            address: address,
-            coordinates: coordinates,
-            pt_id: pt_id,
-            popularity: popularity
-        }
-        return point_of_interest;
     })
-
-
-    console.log(allPois);
 
     res.send(allPois)
 })
 
-app.post('/uservisited', async function (req, res) {
-    const pointId = req.body.pointId;
-    const numberOfPeople = req.body.numberOfPeople || null;
+app.post('/uservisited', requireLogin, async (req, res) => {
+    const pointId = req.body.pointId
+    const numberOfPeople = req.body.numberOfPeople || null
 
-    const sql = `INSERT INTO userVisitedPoint(pointId,timestamp,userID, numberOfUsers) VALUES(${pointId}, now(), ${loggedInUser.loggedInUserId}, ${numberOfPeople})`
-    console.log(sql);
-    const response = await myDatabase.query(sql)
-    console.log(response);
-    if (response[0].affectedRows > 0) {
+    const [result] = await myDatabase.query(
+        'INSERT INTO userVisitedPoint (pointId, timestamp, userID, numberOfUsers) VALUES (?, NOW(), ?, ?)',
+        [pointId, req.session.user.id, numberOfPeople]
+    )
+
+    if (result.affectedRows > 0) {
         res.status(200).send('Submited Successfully')
     } else {
         res.status(500).send('something went wrong')
     }
 })
 
-app.post('/submitCovid', async function (req, res) {
+app.post('/submitCovid', requireLogin, async (req, res) => {
+    const userId = req.session.user.id
+    const submittedDate = req.body.date
 
-    let newDate = req.body.date;
-    const sql1 = `SELECT infected_date from infected_users where userID=${loggedInUser.loggedInUserId} ORDER BY infected_date DESC;`
-    const response1 = await myDatabase.query(sql1)
-    let lastDate = response1[0][0]?.infected_date;
+    const [rows] = await myDatabase.query(
+        'SELECT infected_date FROM infected_users WHERE userID = ? ORDER BY infected_date DESC',
+        [userId]
+    )
+    const lastDate = rows[0]?.infected_date
 
-    console.log(newDate, 'herer11');
-    const _newDate = newDate;
-    lastDate = lastDate ? new Date(lastDate) : new Date();
-    newDate = new Date(newDate)
-    console.log(newDate, 'herer');
-    if (Math.ceil(Math.abs(newDate - lastDate) / (1000 * 60 * 60 * 24)) > 14) {
-
-        const sql = `INSERT INTO infected_users(userID ,isInfected, infected_date) VALUES(${loggedInUser.loggedInUserId}, 1, '${_newDate}')`
-        console.log(sql, loggedInUser.loggedInUserId);
-
-        const response = await myDatabase.query(sql)
-
-        if (response[0].affectedRows > 0) {
-            res.status(200).send('Submited Successfully')
-        } else {
-            res.status(500).send('something went wrong')
-        }
-    } else {
-        res.status(201).send('Not enough Days passed')
-    }
-    res.send()
-})
-
-
-app.post('/editprofile', async function (req, res) {
-    const userInfoToChange = {
-        email: req.body.email,
-        username: req.body.username,
-        password: req.body.password,
+    // A new positive test can be declared only if more than 14 days have passed since the last one.
+    if (lastDate) {
+        const daysBetween = Math.ceil(Math.abs(new Date(submittedDate) - new Date(lastDate)) / (1000 * 60 * 60 * 24))
+        if (daysBetween <= 14) return res.status(201).send('Not enough Days passed')
     }
 
-    let thingsToChange = [
-        userInfoToChange.email ? 'email' : '',
-        userInfoToChange.username ? 'username' : '',
-        userInfoToChange.password ? 'password' : '',
-    ];
+    const [result] = await myDatabase.query(
+        'INSERT INTO infected_users (userID, isInfected, infected_date) VALUES (?, 1, ?)',
+        [userId, submittedDate]
+    )
 
-    thingsToChange = thingsToChange.filter(thing => thing)
-
-    console.log(thingsToChange);
-    let sql = `UPDATE users set `
-    thingsToChange.forEach((thing, index, array) => sql += `${thing}='${userInfoToChange[thing]}'${array[index + 1] ? ',' : ''}`)
-    sql += `WHERE userID=${loggedInUser.loggedInUserId}`;
-
-    const dbResp = await myDatabase.query(sql);
-
-    if (dbResp[0].affectedRows > 0) {
-        res.status(200).send('Profile Updated Successfully')
+    if (result.affectedRows > 0) {
+        res.status(200).send('Submited Successfully')
     } else {
         res.status(500).send('something went wrong')
     }
-
-    console.log(sql);
-
 })
 
-app.get('/visite_place', async function (req, res) {
+app.get('/visite_place', requireLogin, async (req, res) => {
+    const userId = req.session.user.id
 
-    const sql = `SELECT DISTINCT name FROM points_of_interest INNER JOIN uservisitedpoint on points_of_interest.pointId=uservisitedpoint.pointId where userID=${loggedInUser.loggedInUserId}`
-    const dbResp = await myDatabase.query(sql);
+    const [places] = await myDatabase.query(
+        `SELECT DISTINCT name FROM points_of_interest
+         INNER JOIN uservisitedpoint ON points_of_interest.pointId = uservisitedpoint.pointId
+         WHERE userID = ?`,
+        [userId]
+    )
+    const [covid] = await myDatabase.query(
+        'SELECT isInfected, infected_date FROM infected_users WHERE userID = ?',
+        [userId]
+    )
 
-    const sqlCovid = `SELECT isInfected, infected_date FROM infected_users where userID=${loggedInUser.loggedInUserId}`
-    const dbResp1 = await myDatabase.query(sqlCovid);
-
-    res.status(200).send({ data: dbResp[0], covidArray: dbResp1[0] })
+    res.status(200).send({ data: places, covidArray: covid })
 })
 
-app.get('/admin_data', async function (req, res) {
-    const total_visits = `SELECT count(*) as totalVisits FROM uservisitedpoint`
-    const total_covid = `SELECT count(*) as totalInfections FROM infected_users`
-    const popularPois = `select points_of_interest.pointId, count(points_of_interest.pointId) as totalVisits, types
-    from users 
-    inner join uservisitedpoint 
-    on users.userID = uservisitedpoint.userID 
-    inner join points_of_interest 
-    on uservisitedpoint.pointId = points_of_interest.pointId 
-    group by pointId 
-    order by totalVisits desc`;
+app.get('/haveIVisitedInfectedPlace', requireLogin, async (req, res) => {
+    const userId = req.session.user.id
+    const [visits] = await myDatabase.query(
+        'SELECT userID, pointId, timestamp FROM uservisitedpoint WHERE userID = ?',
+        [userId]
+    )
 
-    const popularCovidPois = `select points_of_interest.pointId, count(points_of_interest.pointId) as totalVisits, types, isInfected
-    from users 
-    inner join uservisitedpoint 
-    on users.userID = uservisitedpoint.userID 
-    inner join points_of_interest 
-    on uservisitedpoint.pointId = points_of_interest.pointId 
-    inner join infected_users
-    on infected_users.userID = users.userID
-    where isInfected=1 and
-    Date(timestamp) > date_sub(infected_date, interval 7 day) and Date(timestamp) < date_add(infected_date, interval 14 day) 
-    group by pointId 
-    order by totalVisits desc
-    `
+    // For every place the user visited, look for infected users who were there within 2 hours
+    // and inside the infection window (7 days before to 14 days after the positive test).
+    const infectedPlaces = await Promise.all(visits.map(async visit => {
+        const [rows] = await myDatabase.query(
+            `SELECT uv.timestamp, points_of_interest.name FROM uservisitedpoint uv
+             INNER JOIN infected_users iu ON uv.userID = iu.userID
+             INNER JOIN points_of_interest ON points_of_interest.pointId = uv.pointId
+             WHERE iu.userID <> ?
+               AND uv.pointId = ?
+               AND ABS(TIMESTAMPDIFF(HOUR, uv.timestamp, ?)) < 2
+               AND DATE(uv.timestamp) > DATE_SUB(iu.infected_date, INTERVAL 7 DAY)
+               AND DATE(uv.timestamp) < DATE_ADD(iu.infected_date, INTERVAL 14 DAY)`,
+            [visit.userID, visit.pointId, visit.timestamp]
+        )
+        return rows[0]
+    }))
 
-    const resp1 = await myDatabase.query(total_visits) //a
-    const resp2 = await myDatabase.query(total_covid)  //b
-    const resp3 = await myDatabase.query(popularPois); //c
-    const resp4 = await myDatabase.query(popularCovidPois); //c
-
-
-    // resp3 .......
-    resp3[0].map(point => point.types = JSON.parse(point.types));
-
-    const myArray = [] // this array has all the times n times, where n is the number of times this point has been visited
-    resp3[0].map(point => point.types.map(type => myArray.push(type)))
-
-    const counts = {};
-    // count how many times each item will be in the array
-    for (const num of myArray) {
-        counts[num] = counts[num] ? counts[num] + 1 : 1;
-    }
-
-
-    //resp4..........
-    resp4[0].map(point => point.types = JSON.parse(point.types));
-
-    const myArray2 = [] // this array has all the times n times, where n is the number of times this point has been visited
-    resp4[0].map(point => point.types.map(type => myArray2.push(type)))
-
-    const counts2 = {};
-    // count how many times each item will be in the array
-    for (const num of myArray2) {
-        counts2[num] = counts2[num] ? counts2[num] + 1 : 1;
-    }
-
-
-
-    res.send({
-        totalVisits: resp1[0][0].totalVisits,
-        totalInfections: resp2[0][0].totalInfections,
-        popularity: counts,
-        popularityInfected: counts2
-    })
+    res.status(200).send(infectedPlaces.filter(Boolean))
 })
 
-app.get('/haveIVisitedInfectedPlace', async function (req, res) {
-    const userId = loggedInUser.loggedInUserId
-    const a = `SELECT userID, pointId, timestamp from uservisitedpoint WHERE userID=${userId}`
-    const resp = await myDatabase.query(a)
-    const userVisitedThesePlaces = resp[0]
-   let infectedPlaces=  await Promise.all (userVisitedThesePlaces.map(async x => {
-        const infectedPoints = `SELECT timestamp, name FROM uservisitedpoint uv  
-        inner join 
-        infected_users iu
-        on uv.userID=iu.userID
-        inner join points_of_interest
-        on points_of_interest.pointId=uv.pointId
-        where 
-            iu.userID<>${x.userID}  
-        AND uv.pointId=${x.pointId}
-        AND TIMESTAMPDIFF(HOUR,uv.timestamp, cast('${x.timestamp}' as DATETIME)) <2 
-        AND Date(timestamp) > date_sub(infected_date, interval 7 day) and Date(timestamp) < date_add(infected_date,interval 14 day)`
-        const resp = await myDatabase.query(infectedPoints)
-        if(resp[0].length > 0 ){
-            return resp[0][0]
-        }
-    
-    }));
+app.get('/logout', (req, res) => {
+    req.session.destroy(() => res.redirect('/'))
+})
 
-    infectedPlaces = infectedPlaces.filter(x=>x);// eliminate undefined
-    res.status(200).send(infectedPlaces)
+app.listen(port, () => {
+    console.log(`COVID Hotspot Tracker running at http://localhost:${port}`)
 })

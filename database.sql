@@ -93,4 +93,5 @@ CREATE TABLE IF NOT EXISTS `points_of_interest` (
   ) ENGINE=InnoDB COLLATE=utf8_unicode_ci;
 
 
-INSERT INTO users (username, email, password, isAdmin) VALUES('admin','admin@admin.admin', 'admin', 1); 
+-- Create the first admin account with:  node create-admin.js <username> <email> <password>
+-- (passwords are stored as bcrypt hashes, so they cannot be inserted here in plain text) 
